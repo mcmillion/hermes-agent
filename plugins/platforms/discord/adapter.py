@@ -263,6 +263,40 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
+def _extract_embed_text(message: Any) -> str:
+    """Flatten a Discord message's embeds into plain text.
+
+    Embed-only messages (link unfurls, GitHub PR cards, CI/error-relay bots)
+    carry no ``.content`` — their payload lives entirely in ``.embeds`` and was
+    otherwise invisible to reply context and history backfill.  Returns the
+    flattened title/url/description/fields/footer, or "" when there are no
+    embeds.  ``getattr``-defensive so ``DeletedReferencedMessage`` and partial
+    objects degrade to the previous (empty) behavior.
+    """
+    parts: list = []
+    for embed in getattr(message, "embeds", None) or []:
+        title = getattr(embed, "title", None)
+        if title:
+            parts.append(str(title))
+        url = getattr(embed, "url", None)
+        if url:
+            parts.append(str(url))
+        description = getattr(embed, "description", None)
+        if description:
+            parts.append(str(description))
+        for field in getattr(embed, "fields", None) or []:
+            name = (getattr(field, "name", None) or "").strip()
+            value = (getattr(field, "value", None) or "").strip()
+            pair = ": ".join(p for p in (name, value) if p)
+            if pair:
+                parts.append(pair)
+        footer = getattr(embed, "footer", None)
+        footer_text = getattr(footer, "text", None) if footer else None
+        if footer_text:
+            parts.append(str(footer_text))
+    return "\n".join(parts)
+
+
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available.
 
@@ -4905,6 +4939,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 if msg.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     return None
                 content = getattr(msg, "clean_content", msg.content) or ""
+                # Embed-only messages (link unfurls, PR/CI cards) carry no
+                # ``content`` — fold in their embed text so they aren't dropped.
+                embed_text = _extract_embed_text(msg)
+                if embed_text:
+                    content = f"{content}\n{embed_text}" if content else embed_text
                 if (
                     str(getattr(msg, "id", "")) in self._nonconversational_messages
                     or _looks_like_nonconversational_history_message(content)
@@ -6234,8 +6273,13 @@ class DiscordAdapter(BasePlatformAdapter):
         reply_to_text = None
         if message.reference:
             reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
+            resolved_ref = message.reference.resolved
+            if resolved_ref:
+                ref_text = getattr(resolved_ref, "content", None) or ""
+                ref_embed = _extract_embed_text(resolved_ref)
+                if ref_embed:
+                    ref_text = f"{ref_text}\n{ref_embed}" if ref_text else ref_embed
+                reply_to_text = ref_text or None
 
         event = MessageEvent(
             text=event_text,
